@@ -57,6 +57,7 @@ if [ ! -f "$WEB_ROOT/master-alex-landing/.env" ]; then
 VITE_SITE_URL=https://services.${DOMAIN}
 VITE_MAIN_SITE_URL=https://${DOMAIN}
 VITE_CONTACT_API_URL=
+VITE_GA_MEASUREMENT_ID=G-P3665Z8JZW
 EOF
 fi
 
