@@ -1,8 +1,13 @@
-import 'dotenv/config'
+import path from 'path'
+import { fileURLToPath } from 'url'
+import dotenv from 'dotenv'
 import cors from 'cors'
 import express from 'express'
 import rateLimit from 'express-rate-limit'
 import sgMail from '@sendgrid/mail'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+dotenv.config({ path: path.join(__dirname, '.env') })
 
 const app = express()
 const PORT = process.env.PORT || 3001
@@ -22,12 +27,28 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
   .map((origin) => origin.trim())
   .filter(Boolean)
 
+const isProduction = process.env.NODE_ENV === 'production'
+
+function isLocalDevOrigin(origin) {
+  if (!origin) return false
+  try {
+    const { hostname, protocol } = new URL(origin)
+    return protocol === 'http:' && (hostname === 'localhost' || hostname === '127.0.0.1')
+  } catch {
+    return false
+  }
+}
+
 app.use(express.json({ limit: '32kb' }))
 
 app.use(
   cors({
     origin(origin, callback) {
-      if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+      if (
+        !origin ||
+        allowedOrigins.includes(origin) ||
+        (!isProduction && isLocalDevOrigin(origin))
+      ) {
         callback(null, true)
         return
       }
@@ -52,14 +73,47 @@ function escapeHtml(value) {
     .replace(/"/g, '&quot;')
 }
 
+function parseEmailList(value) {
+  return (value || '')
+    .split(',')
+    .map((email) => email.trim())
+    .filter(Boolean)
+}
+
+function getFromAddress() {
+  return {
+    email: process.env.SENDGRID_FROM_EMAIL,
+    name: process.env.SENDGRID_FROM_NAME || 'Master Alex',
+  }
+}
+
+function getToAddresses() {
+  const recipients = parseEmailList(process.env.CONTACT_TO_EMAIL)
+  const bcc = parseEmailList(process.env.CONTACT_BCC_EMAIL)
+  return { to: recipients, bcc }
+}
+
 function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
 }
 
+function getSendGridErrorMessage(error) {
+  const errors = error?.response?.body?.errors
+  if (Array.isArray(errors) && errors.length > 0) {
+    return errors.map((e) => e.message).join(' ')
+  }
+  return error?.message || 'Unknown SendGrid error'
+}
+
 app.get('/api/health', (_req, res) => {
+  const { to } = getToAddresses()
   res.json({
     ok: true,
-    sendgridConfigured: Boolean(process.env.SENDGRID_API_KEY && process.env.SENDGRID_FROM_EMAIL),
+    sendgridConfigured: Boolean(
+      process.env.SENDGRID_API_KEY && process.env.SENDGRID_FROM_EMAIL && to.length > 0,
+    ),
+    from: process.env.SENDGRID_FROM_EMAIL || null,
+    to,
   })
 })
 
@@ -97,7 +151,13 @@ app.post('/api/contact', contactLimiter, async (req, res) => {
       page: (page || 'Unknown page').trim(),
     }
 
-    const subject = `New enquiry from ${trimmed.name} — ${trimmed.page}`
+    const { to, bcc } = getToAddresses()
+    if (to.length === 0) {
+      res.status(503).json({ error: 'Email service is not configured.' })
+      return
+    }
+
+    const subject = `Master Alex — New enquiry from ${trimmed.name}`
     const text = [
       'New contact form submission',
       '',
@@ -110,6 +170,10 @@ app.post('/api/contact', contactLimiter, async (req, res) => {
       '',
       'Message:',
       trimmed.message,
+      '',
+      '---',
+      `Reply to customer: ${trimmed.email}`,
+      `Call customer: ${trimmed.phone}`,
     ]
       .filter(Boolean)
       .join('\n')
@@ -119,26 +183,58 @@ app.post('/api/contact', contactLimiter, async (req, res) => {
       <p><strong>Source:</strong> ${escapeHtml(trimmed.source)}</p>
       <p><strong>Page:</strong> ${escapeHtml(trimmed.page)}</p>
       <p><strong>Name:</strong> ${escapeHtml(trimmed.name)}</p>
-      <p><strong>Email:</strong> ${escapeHtml(trimmed.email)}</p>
-      <p><strong>Phone:</strong> ${escapeHtml(trimmed.phone)}</p>
+      <p><strong>Email:</strong> <a href="mailto:${escapeHtml(trimmed.email)}">${escapeHtml(trimmed.email)}</a></p>
+      <p><strong>Phone:</strong> <a href="tel:${escapeHtml(trimmed.phone.replace(/\s/g, ''))}">${escapeHtml(trimmed.phone)}</a></p>
       ${trimmed.date ? `<p><strong>Preferred date:</strong> ${escapeHtml(trimmed.date)}</p>` : ''}
       <p><strong>Message:</strong></p>
       <p>${escapeHtml(trimmed.message).replace(/\n/g, '<br>')}</p>
+      <p style="margin-top:24px;padding:12px;background:#f4f4f5;border-radius:8px;">
+        <strong>Reply to customer:</strong>
+        <a href="mailto:${escapeHtml(trimmed.email)}">${escapeHtml(trimmed.email)}</a>
+      </p>
     `
 
-    await sgMail.send({
-      to: process.env.CONTACT_TO_EMAIL,
-      from: process.env.SENDGRID_FROM_EMAIL,
-      replyTo: trimmed.email,
+    const fromEmail = process.env.SENDGRID_FROM_EMAIL.toLowerCase()
+    const isSelfInbox = to.every((addr) => addr.toLowerCase() === fromEmail)
+
+    const mail = {
+      to,
+      from: getFromAddress(),
       subject,
       text,
       html,
-    })
+      mailSettings: {
+        bypassListManagement: { enable: true },
+      },
+      headers: {
+        Importance: 'high',
+      },
+    }
+
+    // Outlook often hides self-sent mail when Reply-To differs from From — skip Reply-To in that case
+    if (!isSelfInbox) {
+      mail.replyTo = { email: trimmed.email, name: trimmed.name }
+    }
+
+    if (bcc.length > 0) {
+      mail.bcc = bcc
+    }
+
+    const [response] = await sgMail.send(mail)
+    const messageId = response?.headers?.['x-message-id']
+    if (messageId) {
+      console.log(`Contact email sent (${messageId}) → ${to.join(', ')}`)
+    }
 
     res.json({ ok: true, message: 'Message sent successfully.' })
   } catch (error) {
+    const detail = getSendGridErrorMessage(error)
     console.error('Contact form error:', error?.response?.body || error)
-    res.status(500).json({ error: 'Failed to send message. Please try again or call us directly.' })
+    res.status(500).json({
+      error: isProduction
+        ? 'Failed to send message. Please try again or call us directly.'
+        : `Failed to send message: ${detail}`,
+    })
   }
 })
 
@@ -151,5 +247,21 @@ app.use((err, _req, res, next) => {
 })
 
 app.listen(PORT, () => {
+  const { to } = getToAddresses()
+  const configured = Boolean(
+    process.env.SENDGRID_API_KEY && process.env.SENDGRID_FROM_EMAIL && to.length > 0,
+  )
   console.log(`Master Alex API listening on port ${PORT}`)
+  console.log(`SendGrid configured: ${configured}`)
+  if (configured) {
+    console.log(`Form emails: ${process.env.SENDGRID_FROM_EMAIL} → ${to.join(', ')}`)
+    if (process.env.SENDGRID_FROM_EMAIL === process.env.CONTACT_TO_EMAIL) {
+      console.warn(
+        'FROM and TO are the same address. Check Spam folder, or authenticate masteralex.co.uk in SendGrid and use noreply@masteralex.co.uk as SENDGRID_FROM_EMAIL.',
+      )
+    }
+  }
+  if (!configured) {
+    console.warn(`Missing env: ${requiredEnv.filter((key) => !process.env[key]).join(', ')}`)
+  }
 })
