@@ -206,9 +206,6 @@ app.post('/api/contact', contactLimiter, async (req, res) => {
       mailSettings: {
         bypassListManagement: { enable: true },
       },
-      headers: {
-        Importance: 'high',
-      },
     }
 
     // Outlook often hides self-sent mail when Reply-To differs from From — skip Reply-To in that case
